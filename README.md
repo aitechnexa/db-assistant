@@ -1,5 +1,7 @@
 # Database Query Assistant 🤖
 
+<!--Last deployed: 2025-11-24-->
+
 A natural language database query assistant powered by LangGraph, FastAPI, and React. Ask questions about your data in plain English and get SQL queries with results.
 
 ![Architecture](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)

@@ -26,12 +26,16 @@ class Settings:
     
     # CORS Settings
     CORS_ORIGINS = [
+        # Local development
         "http://localhost:5173",
         "http://localhost:3000",
         "http://localhost:5020",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
-        "http://127.0.0.1:5020"
+        "http://127.0.0.1:5020",
+        # Production
+        "https://db-assistant.aitechnexa.com",
+        "http://db-assistant.aitechnexa.com"
     ]
     
     # Query Settings
