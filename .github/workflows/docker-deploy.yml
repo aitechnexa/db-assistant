@@ -159,21 +159,6 @@ jobs:
                 - db-assistant-network
               restart: unless-stopped
 
-            nginx:
-              image: nginx:alpine
-              container_name: db-assistant-nginx
-              ports:
-                - "80:80"
-                - "443:443"
-              volumes:
-                - ./nginx.conf:/etc/nginx/nginx.conf:ro
-              depends_on:
-                - backend
-                - frontend
-              networks:
-                - db-assistant-network
-              restart: unless-stopped
-
           networks:
             db-assistant-network:
               driver: bridge
@@ -196,7 +181,7 @@ jobs:
           sshpass -p "${SSH_PASSWORD}" scp \
             -o StrictHostKeyChecking=no \
             -P "${SSH_PORT}" \
-            .env.deploy docker-compose.prod.yml nginx.conf \
+            .env.deploy docker-compose.prod.yml \
             "${SSH_USER}@${SSH_HOST}:/tmp/"
 
       - name: Deploy on server
@@ -221,7 +206,6 @@ jobs:
             chmod -R 777 data; \
             mv /tmp/.env.deploy .env; \
             mv /tmp/docker-compose.prod.yml docker-compose.yml; \
-            mv /tmp/nginx.conf nginx.conf; \
             echo 'Logging into container registry...'; \
             echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin; \
             echo 'Pulling latest images...'; \
