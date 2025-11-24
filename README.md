@@ -158,6 +158,72 @@ npm run dev
 docker-compose up --build
 ```
 
+### Database Migrations (Alembic)
+
+All Alembic commands should be run inside the backend container:
+
+```bash
+# Access the backend container shell
+docker-compose exec backend bash
+
+# Inside the container, you can run Alembic commands:
+```
+
+**Common Alembic Commands:**
+
+```bash
+# Check current migration status
+docker-compose exec backend alembic current
+
+# View migration history
+docker-compose exec backend alembic history
+
+# Auto-generate a new migration (detects model changes)
+docker-compose exec backend alembic revision --autogenerate -m "description of changes"
+
+# Create a blank migration file
+docker-compose exec backend alembic revision -m "description"
+
+# Apply all pending migrations (upgrade to latest)
+docker-compose exec backend alembic upgrade head
+
+# Rollback one migration
+docker-compose exec backend alembic downgrade -1
+
+# Rollback to specific revision
+docker-compose exec backend alembic downgrade <revision_id>
+
+# Show SQL that would be executed (dry run)
+docker-compose exec backend alembic upgrade head --sql
+```
+
+**Example Workflow:**
+
+```bash
+# 1. Make changes to your SQLAlchemy models (backend/app/models/*.py)
+
+# 2. Auto-generate migration
+docker-compose exec backend alembic revision --autogenerate -m "add user quota table"
+
+# 3. Review the generated migration file in backend/alembic/versions/
+
+# 4. Apply the migration
+docker-compose exec backend alembic upgrade head
+
+# 5. Verify it was applied
+docker-compose exec backend alembic current
+```
+
+**On Production Server:**
+
+```bash
+# SSH into your server
+cd /opt/db-assistant
+
+# Run migrations
+docker compose exec backend alembic upgrade head
+```
+
 ## 📝 API Endpoints
 
 **Authentication:**
