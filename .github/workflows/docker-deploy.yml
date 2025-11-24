@@ -138,7 +138,7 @@ jobs:
                 - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
                 - DATABASE_URL=${DATABASE_URL}
               volumes:
-                - ./data:/app/data
+                - app_data:/app/data
               depends_on:
                 postgres:
                   condition: service_healthy
@@ -165,6 +165,7 @@ jobs:
 
           volumes:
             postgres_data:
+            app_data:
           EOF
 
       - name: Transfer deployment files
@@ -201,9 +202,6 @@ jobs:
             "set -euo pipefail; \
             mkdir -p ${{ env.DEPLOY_DIR }}; \
             cd ${{ env.DEPLOY_DIR }}; \
-            echo 'Creating data directories...'; \
-            mkdir -p data; \
-            chmod -R 777 data; \
             mv /tmp/.env.deploy .env; \
             mv /tmp/docker-compose.prod.yml docker-compose.yml; \
             echo 'Logging into container registry...'; \

@@ -33,7 +33,7 @@ services:
       - DATABASE_URL=postgresql://dbassistant:${POSTGRES_PASSWORD}@postgres:5432/dbassistant
     volumes:
       - ./backend:/app
-      - ./data:/app/data
+      - app_data:/app/data
     command: /app/start.sh
     depends_on:
       postgres:
@@ -63,5 +63,5 @@ networks:
     driver: bridge
 
 volumes:
-  data:
+  app_data:
   postgres_data:
