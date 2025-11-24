@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: db-assistant-postgres
+    environment:
+      - POSTGRES_USER=dbassistant
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=dbassistant
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - db-assistant-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbassistant"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: db-assistant-backend
+    ports:
+      - "5010:5010"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
+      - DATABASE_URL=postgresql://dbassistant:${POSTGRES_PASSWORD}@postgres:5432/dbassistant
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    command: /app/start.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - db-assistant-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: db-assistant-frontend
+    ports:
+      - "5020:5020"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:5010
+    depends_on:
+      - backend
+    networks:
+      - db-assistant-network
+
+networks:
+  db-assistant-network:
+    driver: bridge
+
+volumes:
+  data:
+  postgres_data:

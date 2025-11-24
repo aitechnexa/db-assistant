@@ -1,0 +1,236 @@
+name: Docker Deploy (Optimized)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+  DEPLOY_DIR: /opt/db-assistant
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        id: image-name
+        run: |
+          echo "IMAGE_NAME_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Backend
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.IMAGE_NAME_LOWER }}-backend
+          tags: |
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for Frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.IMAGE_NAME_LOWER }}-frontend
+          tags: |
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Create deployment files
+        run: |
+          # Convert repository name to lowercase
+          IMAGE_NAME_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+          
+          # Create .env file
+          cat > .env.deploy << EOF
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          DATABASE_ENCRYPTION_KEY=${{ secrets.DATABASE_ENCRYPTION_KEY }}
+          DATABASE_URL=postgresql://dbassistant:${{ secrets.POSTGRES_PASSWORD }}@postgres:5432/dbassistant
+          POSTGRES_USER=dbassistant
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=dbassistant
+          BACKEND_IMAGE=${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}-backend:latest
+          FRONTEND_IMAGE=${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}-frontend:latest
+          EOF
+
+          # Create production docker-compose.yml
+          cat > docker-compose.prod.yml << 'EOF'
+          version: '3.8'
+
+          services:
+            postgres:
+              image: postgres:15-alpine
+              container_name: db-assistant-postgres
+              environment:
+                - POSTGRES_USER=${POSTGRES_USER}
+                - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+                - POSTGRES_DB=${POSTGRES_DB}
+              ports:
+                - "5433:5432"
+              volumes:
+                - postgres_data:/var/lib/postgresql/data
+              networks:
+                - db-assistant-network
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U dbassistant"]
+                interval: 5s
+                timeout: 5s
+                retries: 5
+              restart: unless-stopped
+
+            backend:
+              image: ${BACKEND_IMAGE}
+              container_name: db-assistant-backend
+              ports:
+                - "5010:5010"
+              environment:
+                - OPENAI_API_KEY=${OPENAI_API_KEY}
+                - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
+                - DATABASE_URL=${DATABASE_URL}
+              volumes:
+                - ./data:/app/data
+              depends_on:
+                postgres:
+                  condition: service_healthy
+              networks:
+                - db-assistant-network
+              restart: unless-stopped
+
+            frontend:
+              image: ${FRONTEND_IMAGE}
+              container_name: db-assistant-frontend
+              ports:
+                - "5020:5020"
+              environment:
+                - VITE_API_URL=http://localhost:5010
+              depends_on:
+                - backend
+              networks:
+                - db-assistant-network
+              restart: unless-stopped
+
+            nginx:
+              image: nginx:alpine
+              container_name: db-assistant-nginx
+              ports:
+                - "80:80"
+                - "443:443"
+              volumes:
+                - ./nginx.conf:/etc/nginx/nginx.conf:ro
+              depends_on:
+                - backend
+                - frontend
+              networks:
+                - db-assistant-network
+              restart: unless-stopped
+
+          networks:
+            db-assistant-network:
+              driver: bridge
+
+          volumes:
+            postgres_data:
+          EOF
+
+      - name: Transfer deployment files
+        run: |
+          SSH_PORT="${{ secrets.SERVER_PORT }}"
+          SSH_USER="${{ secrets.SERVER_USER }}"
+          SSH_HOST="${{ secrets.SERVER_HOST }}"
+          SSH_PASSWORD="${{ secrets.SERVER_PASSWORD }}"
+          
+          # Use default port 22 if not specified
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_USER="${SSH_USER:-root}"
+          
+          sshpass -p "${SSH_PASSWORD}" scp \
+            -o StrictHostKeyChecking=no \
+            -P "${SSH_PORT}" \
+            .env.deploy docker-compose.prod.yml nginx.conf \
+            "${SSH_USER}@${SSH_HOST}:/tmp/"
+
+      - name: Deploy on server
+        run: |
+          SSH_PORT="${{ secrets.SERVER_PORT }}"
+          SSH_USER="${{ secrets.SERVER_USER }}"
+          SSH_HOST="${{ secrets.SERVER_HOST }}"
+          SSH_PASSWORD="${{ secrets.SERVER_PASSWORD }}"
+          
+          # Use default port 22 if not specified
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_USER="${SSH_USER:-root}"
+          SSH_OPTIONS="-o StrictHostKeyChecking=no -p ${SSH_PORT}"
+          
+          sshpass -p "${SSH_PASSWORD}" ssh ${SSH_OPTIONS} \
+            "${SSH_USER}@${SSH_HOST}" \
+            "set -euo pipefail; \
+            mkdir -p ${{ env.DEPLOY_DIR }}; \
+            cd ${{ env.DEPLOY_DIR }}; \
+            echo 'Creating data directories...'; \
+            mkdir -p data; \
+            chmod -R 777 data; \
+            mv /tmp/.env.deploy .env; \
+            mv /tmp/docker-compose.prod.yml docker-compose.yml; \
+            mv /tmp/nginx.conf nginx.conf; \
+            echo 'Logging into container registry...'; \
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin; \
+            echo 'Pulling latest images...'; \
+            docker compose pull; \
+            echo 'Restarting services...'; \
+            docker compose up -d --remove-orphans; \
+            echo '✓ Deployment complete'; \
+            docker compose ps;"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f .env.deploy docker-compose.prod.yml
