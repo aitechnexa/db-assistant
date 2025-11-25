@@ -152,7 +152,7 @@ jobs:
               ports:
                 - "5020:5020"
               environment:
-                - VITE_API_URL=http://localhost:5010
+                - VITE_API_URL=http://db-assistant.aitechnexa.com
               depends_on:
                 - backend
               networks:
