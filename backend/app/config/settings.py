@@ -47,6 +47,7 @@ class Settings:
         "https://db-assistant.aitechnexa.com",
         "http://db-assistant.aitechnexa.com",
         "http://152.42.248.82",
+        "http://152.42.248.82:5020",
     ]
     
     # Query Settings
