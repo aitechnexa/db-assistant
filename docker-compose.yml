@@ -72,8 +72,6 @@ services:
     container_name: db-assistant-frontend
     ports:
       - "5020:5020"
-    environment:
-      - VITE_API_URL=http://localhost:5010
     depends_on:
       - backend
     networks:
