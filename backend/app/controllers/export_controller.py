@@ -1,6 +1,7 @@
 from fastapi import HTTPException, Response
 from ..models import ExportRequest, QueryExportRequest
 from ..utils.export_utils import export_to_csv, export_to_xlsx
+from ..config.settings import settings
 
 class ExportController:
     """Controller for export operations"""
@@ -47,16 +48,13 @@ class ExportController:
         try:
             from ..services.database_service import DatabaseService
             
-            # Execute query with high limit (100k)
-            # We use a hard limit of 100,000 for exports to prevent OOM
-            EXPORT_LIMIT = 100000
-            
+            # Execute query with configured max export limit
             results = await DatabaseService.execute_query(
                 db=db,
                 user_id=user_id,
                 connection_id=request.database_id,
                 query=request.sql_query,
-                limit=EXPORT_LIMIT
+                limit=settings.MAX_EXPORT_LIMIT
             )
             
             csv_data = export_to_csv(results["data"])

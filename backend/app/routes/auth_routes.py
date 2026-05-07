@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from datetime import timedelta, date
+from dataclasses import dataclass
 from app.database import get_db
 from app.models.auth import UserCreate, UserLogin, UserResponse, Token
 from app.models.db_models import User, QueryUsage
@@ -11,13 +12,37 @@ from app.config.settings import settings
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 security = HTTPBearer()
 
+
+@dataclass
+class AuthUser:
+    """Lightweight user object built from JWT claims — no DB query needed."""
+    id: int
+    email: str
+    subscription_tier: str
+    is_active: bool
+    is_admin: bool
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
-    """Dependency to get current authenticated user"""
+) -> AuthUser:
+    """Validate JWT and return AuthUser built from claims (zero DB queries)."""
     token = credentials.credentials
-    return await AuthService.get_current_user(db, token)
+    payload = AuthService.decode_token(token)
+    if not payload or "sub" not in payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+    if not payload.get("is_active", True):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
+    return AuthUser(
+        id=payload["sub"],
+        email=payload.get("email", ""),
+        subscription_tier=payload.get("tier", "free"),
+        is_active=payload.get("is_active", True),
+        is_admin=payload.get("is_admin", False),
+    )
 
 @router.post("/register", response_model=UserResponse)
 async def register(user_data: UserCreate, db: Session = Depends(get_db)):
@@ -64,8 +89,8 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
     # Create access token
     access_token_expires = timedelta(hours=settings.ACCESS_TOKEN_EXPIRE_HOURS)
     access_token = AuthService.create_access_token(
-        data={"sub": user.id},
-        expires_delta=access_token_expires
+        user=user,
+        expires_delta=access_token_expires,
     )
     
     # Get limits for the user's tier

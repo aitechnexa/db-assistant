@@ -1,8 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from .config.settings import settings
 from .routes import database_routes, query_routes, export_routes, auth_routes, chat_routes, conversation_routes, admin_routes
 from .services.auth_service import AuthService
+from .services.llm_provider import get_llm
 
 # Validate settings
 settings.validate()
@@ -17,6 +19,9 @@ app = FastAPI(
     version=settings.APP_VERSION
 )
 
+# GZip compression for all API responses >= 500 bytes
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +30,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-warm LLM on startup to eliminate first-request cold-start delay."""
+    try:
+        get_llm()
+    except Exception as e:
+        print(f"⚠️  LLM pre-warm failed (will retry on first request): {e}")
 
 @app.get("/")
 async def root():

@@ -10,11 +10,21 @@ class Settings:
     APP_VERSION = "1.0.0"
     APP_DESCRIPTION = "Natural language database query assistant with LangGraph"
     
+    # LLM Provider: "ollama" or "openai"
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
+    
+    # Ollama Settings
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+    OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
+    
     # OpenAI Settings
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_MODEL = "gpt-4o-mini"
-    OPENAI_REASONING_MODEL = "o1"  # Reasoning model for complex query understanding with chain-of-thought
-        
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # Schema cache TTL in seconds
+    SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "1800"))  # 30 minutes
+    
     # Database Settings
     DATABASE_ENCRYPTION_KEY = os.getenv("DATABASE_ENCRYPTION_KEY")
     DATA_DIR = "data"
@@ -39,13 +49,14 @@ class Settings:
     ]
     
     # Query Settings
-    DEFAULT_QUERY_LIMIT = 5000
+    DEFAULT_QUERY_LIMIT = 1000  # Reduced from 5000 for low memory environments
+    MAX_EXPORT_LIMIT = 10000    # Maximum for exports to prevent OOM
     
     @classmethod
     def validate(cls):
         """Validate required settings"""
-        if not cls.OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        if cls.LLM_PROVIDER == "openai" and not cls.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not found in environment variables (required when LLM_PROVIDER=openai)")
         
         if not cls.DATABASE_ENCRYPTION_KEY:
             cls.DATABASE_ENCRYPTION_KEY = Fernet.generate_key().decode()

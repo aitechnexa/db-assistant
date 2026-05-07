@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Enum, Date, JSON, Numeric
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Enum, Date, JSON, Numeric, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -94,6 +94,9 @@ class Message(Base):
 
 class QueryUsage(Base):
     __tablename__ = "query_usage"
+    __table_args__ = (
+        UniqueConstraint("user_id", "query_date", name="uq_query_usage_user_date"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)

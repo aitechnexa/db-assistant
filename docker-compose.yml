@@ -9,9 +9,11 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=dbassistant
     ports:
-      - "5433:5432"  # Exposed for pgAdmin access
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
     networks:
       - db-assistant-network
     healthcheck:
@@ -19,6 +21,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+    restart: unless-stopped
 
   backend:
     build:
@@ -28,11 +38,17 @@ services:
     ports:
       - "5010:5010"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
       - DATABASE_URL=postgresql://dbassistant:${POSTGRES_PASSWORD}@postgres:5432/dbassistant
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:7b}
+      - SCHEMA_CACHE_TTL=${SCHEMA_CACHE_TTL:-1800}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./backend:/app
       - app_data:/app/data
     command: /app/start.sh
     depends_on:
@@ -40,6 +56,14 @@ services:
         condition: service_healthy
     networks:
       - db-assistant-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.75'
+        reservations:
+          memory: 256M
+    restart: unless-stopped
 
   frontend:
     build:
@@ -48,15 +72,20 @@ services:
     container_name: db-assistant-frontend
     ports:
       - "5020:5020"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
     environment:
       - VITE_API_URL=http://localhost:5010
     depends_on:
       - backend
     networks:
       - db-assistant-network
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.25'
+        reservations:
+          memory: 32M
+    restart: unless-stopped
 
 networks:
   db-assistant-network:

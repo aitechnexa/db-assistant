@@ -1,602 +1,552 @@
-from typing import TypedDict
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from ..config.settings import settings
+from typing import Optional
+from decimal import Decimal
+from datetime import date, datetime
+from sqlalchemy import text
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+from .llm_provider import get_llm
+import asyncio
 import re
 
 
-SQL_SYSTEM_PROMPT = """You are DBAssistant, an assistant that reads a provided database schema and produces precise, auditable actions to satisfy user questions. Always follow these rules:
+DANGEROUS_KEYWORDS = {
+    "DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
+    "TRUNCATE", "CREATE", "REPLACE", "MERGE", "EXEC", "EXECUTE"
+}
 
-1) Output only valid JSON with the keys exactly as specified below. Do not include extra text.
-2) Keys:
-   - "action": one of ["SQL", "TOOL_SEARCH", "ANSWER", "CLARIFY"]
-   - "sql": string (present if action == "SQL")
-   - "tools": list of tool calls (present if action == "TOOL_SEARCH")
-   - "answer": string (present if action == "ANSWER")
-   - "clarify": string (present if action == "CLARIFY")
-   - "explain": short string explaining reasoning in 1-2 sentences.
-3) When returning SQL:
-   - Use only tables and columns listed in the schema below.
-   - Limit rows using `LIMIT 100` unless the question explicitly asks for full export.
-   - Avoid `DELETE`, `UPDATE`, `DROP` — only `SELECT` is allowed.
-4) When uncertain about user intent or ambiguous fields produce action "CLARIFY" and ask a single simple question.
-5) If the question can be answered from metadata alone (counts, column names), use "ANSWER".
-6) Keep SQL and tool calls minimal and auditable.
-
-**CURRENT DATE/TIME CONTEXT:**
-- Today's date: {current_date}
-- Current year: {current_year}
-- Current month: {current_month}
-
-**CRITICAL - Temporal Reasoning (BE DECISIVE, NOT CAUTIOUS):**
-When users mention time periods, ALWAYS use reasonable defaults. DO NOT ask for clarification unless truly impossible to infer:
-
-**Month without year mentioned:**
-- "in October", "October sales", "how much in October" → Use October {current_year}
-- If it's currently November 2025 and user says "in October" → Use October 2025 (just last month)
-- If it's currently March 2025 and user says "in December" → Use December 2024 (most recent)
-
-**Time references:**
-- "last month" → Calculate based on {current_date} automatically
-- "this month" → Use {current_month} {current_year}
-- "this year" → Use {current_year}
-- "recent" / "recently" → Default to last 30 days from {current_date}
-
-**When to use CLARIFY (RARELY):**
-- ONLY if time period is genuinely ambiguous like: "a while ago", "some time back", "in the past"
-- DO NOT CLARIFY for: "in October", "last month", "recent", "this year" - JUST USE REASONABLE DEFAULTS
-
-**Rule:** Prefer generating SQL with reasonable date assumptions over asking for clarification.
+TOOL_ICONS = {
+    "list_tables": "📋",
+    "describe_table": "🔍",
+    "sample_rows": "📄",
+    "get_foreign_keys": "🔗",
+    "get_table_relationships": "🗺️",
+    "get_indexes": "⚡",
+    "get_column_stats": "📊",
+    "get_distinct_values": "🏷️",
+    "get_date_range": "📅",
+    "search_values": "🔎",
+    "count_rows": "🔢",
+    "explain_query": "🧐",
+    "run_sql": "▶️",
+}
 
 
-**CRITICAL - Business Terminology Understanding**:
-Pay special attention to the ROLE of people mentioned in queries:
+def _build_agent_system_prompt() -> str:
+    today = date.today()
+    return f"""You are DBAssistant, an expert AI database analyst. You have tools to explore any database and answer questions about its data.
 
-**When someone SELLS/SOLD something:**
-- They are the SELLER/SALESPERSON/EMPLOYEE/USER who made the sale
-- Look for columns like: salesperson_name, employee_name, user_name, seller_name, sales_rep, created_by, sold_by
+GOAL: Always call run_sql() to retrieve data and answer the user's question. Do not stop before executing a query.
 
-**When someone BUYS/BOUGHT/PURCHASED something:**
-- They are the CUSTOMER/BUYER who purchased
-- Look for columns like: customer_name, buyer_name, client_name
+TOOL USAGE STRATEGY:
+1. Call list_tables() to see available tables
+2. Call describe_table() on the relevant table(s) to get column names and types
+3. If JOINs are needed, call get_foreign_keys() to understand relationships
+4. Write the SQL query and call run_sql() — do this as soon as you have enough information
+5. If run_sql() fails, analyze the error and retry with a corrected query (up to 3 attempts)
+6. Only use other exploration tools (get_distinct_values, get_date_range, search_values, count_rows) when strictly necessary for filters
 
-**CRITICAL - DATETIME vs DATE Handling:**
-When comparing DATE values with DATETIME columns (e.g., invoice_date, created_at, order_date):
-- ❌ WRONG: `WHERE invoice_date = '2025-11-22'` (fails because DATETIME includes time)
-- ✅ CORRECT Option 1: `WHERE DATE(invoice_date) = '2025-11-22'` (extract date part)
-- ✅ CORRECT Option 2: `WHERE invoice_date >= '2025-11-22' AND invoice_date < '2025-11-23'` (use range)
+CRITICAL RULES:
+- ALWAYS call run_sql() — never return an answer without executing a query for data questions
+- Only SELECT queries are allowed
+- Always use LIMIT 100 unless user explicitly asks for all data
+- For PostgreSQL: use ILIKE for case-insensitive text matching
+- For MySQL: use LIKE (case-insensitive by default)
+- For SQLite: use LIKE
+- When joining tables, always use explicit column aliases to avoid ambiguity
+- For DATETIME columns: use DATE(col) = 'YYYY-MM-DD' or range comparisons
 
-**For "today", "yesterday", "specific date" queries:**
-- Use DATE() function or date ranges when column is DATETIME type
-- Example: "sales for yesterday" → `WHERE DATE(invoice_date) = '2025-11-22'`
-- Example: "sales on Nov 22" → `WHERE DATE(created_at) = '2025-11-22'`
+DATE CONTEXT:
+- Current date: {today.isoformat()}
+- Current month: {today.strftime('%B %Y')}
+- Current year: {today.year}
 
-**CRITICAL - Revenue vs Expenses:**
-- "how much X makes/made/earned" → REVENUE/SALES/INCOME → Use Invoices, Sales, Orders, Revenue tables
-- "how much X spent/spend" → EXPENSES/COSTS → Use Expenses, Costs, Purchases tables
+Once you have query results, summarize the answer clearly for the user."""
 
-**CRITICAL - Fuzzy Matching (Database Type: {db_type})**:
-When searching for names, products, or text values using partial matches:
 
-**For PostgreSQL databases:**
-- Use ILIKE for case-insensitive matching
-- Example: WHERE name ILIKE '%azka%'
+def _convert_value(value):
+    """Convert DB values to JSON-serializable types."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
-**For MySQL databases:**
-- Use LIKE for pattern matching (case-insensitive by default in MySQL)
-- Example: WHERE name LIKE '%azka%'
 
-**For SQLite databases:**
-- Use LIKE for pattern matching
-- Example: WHERE name LIKE '%azka%'
+def _is_safe_query(query: str) -> bool:
+    """Return True only for SELECT/WITH/EXPLAIN queries with no dangerous keywords."""
+    q = query.strip().upper()
+    if not (q.startswith("SELECT") or q.startswith("WITH") or q.startswith("EXPLAIN")):
+        return False
+    for kw in DANGEROUS_KEYWORDS:
+        if re.search(rf"\b{kw}\b", q):
+            return False
+    return True
 
-**CRITICAL - Subquery Handling:**
-- ✅ CORRECT: `WHERE user_id IN (SELECT user_id FROM Users WHERE name LIKE '%azka%')`
-- ❌ WRONG: `WHERE user_id = (SELECT user_id FROM Users WHERE name LIKE '%azka%')`
 
-Database Schema:
-{schema}
-"""
+def _is_safe_where(clause: str) -> bool:
+    """Return True if WHERE clause contains no dangerous keywords."""
+    c = clause.upper()
+    for kw in list(DANGEROUS_KEYWORDS) + [";"]:
+        if kw in c:
+            return False
+    return True
 
-class AgentState(TypedDict):
-    question: str
-    schema: str
-    sql_query: str
-    results: dict
-    answer: str
-    summary: str
-    error: str
-    use_deep_think: bool
-    refined_question: str
-    reasoning: str
-    conversation_history: list  # List of previous messages for context
-    db_type: str  # Database type: 'postgresql', 'mysql', or 'sqlite'
-    needs_clarification: bool  # Whether query is ambiguous
-    clarification_options: list  # List of clarification choices
+
+def _quote_ident(name: str, db_type: str) -> str:
+    """Quote an identifier appropriately for the DB type."""
+    if db_type == "mysql":
+        return f"`{name.replace('`', '``')}`"
+    return f'"{name.replace(chr(34), chr(34) * 2)}"'
+
+
+def build_tools(engine, db_type: str, db_name: str = ""):
+    """Build all 13 LangChain tools for DB exploration. Returns (tools_list, results_store)."""
+
+    results_store = {"sql": "", "results": None, "error": ""}
+
+    def qi(name: str) -> str:
+        return _quote_ident(name, db_type)
+
+    # ── Tool 1 ────────────────────────────────────────────────────────────────
+    @tool
+    def list_tables() -> str:
+        """List all tables in the connected database. Always call this first."""
+        try:
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    q = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name"
+                elif db_type == "mysql":
+                    q = f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{db_name}' AND table_type = 'BASE TABLE' ORDER BY table_name"
+                else:
+                    q = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                rows = conn.execute(text(q)).fetchall()
+                tables = [r[0] for r in rows]
+                return f"Tables ({len(tables)}):\n" + "\n".join(f"  - {t}" for t in tables)
+        except Exception as e:
+            return f"Error listing tables: {e}"
+
+    # ── Tool 2 ────────────────────────────────────────────────────────────────
+    @tool
+    def describe_table(table_name: str) -> str:
+        """Get column names and data types for a specific table."""
+        try:
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    q = text("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :t ORDER BY ordinal_position")
+                    rows = conn.execute(q, {"t": table_name}).fetchall()
+                    lines = [f"  {r[0]} ({r[1]}) {'NULL' if r[2] == 'YES' else 'NOT NULL'}" for r in rows]
+                elif db_type == "mysql":
+                    q = text("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = :db AND table_name = :t ORDER BY ordinal_position")
+                    rows = conn.execute(q, {"db": db_name, "t": table_name}).fetchall()
+                    lines = [f"  {r[0]} ({r[1]}) {'NULL' if r[2] == 'YES' else 'NOT NULL'}" for r in rows]
+                else:
+                    rows = conn.execute(text(f"PRAGMA table_info({qi(table_name)})")).fetchall()
+                    lines = [f"  {r[1]} ({r[2]}) {'NULL' if not r[3] else 'NOT NULL'}" for r in rows]
+                if not lines:
+                    return f"Table '{table_name}' not found or has no columns."
+                return f"Columns of '{table_name}':\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error describing table '{table_name}': {e}"
+
+    # ── Tool 3 ────────────────────────────────────────────────────────────────
+    @tool
+    def sample_rows(table_name: str, limit: int = 5) -> str:
+        """Get sample rows from a table to understand data patterns and formats."""
+        try:
+            safe_limit = min(max(1, limit), 10)
+            with engine.connect() as conn:
+                rows = conn.execute(text(f"SELECT * FROM {qi(table_name)} LIMIT {safe_limit}")).fetchall()
+                if not rows:
+                    return f"Table '{table_name}' is empty."
+                keys = list(conn.execute(text(f"SELECT * FROM {qi(table_name)} LIMIT 0")).keys())
+                lines = []
+                for i, row in enumerate(rows, 1):
+                    pairs = ", ".join(f"{k}={str(v)[:40]}" for k, v in zip(keys, row))
+                    lines.append(f"  Row {i}: {pairs}")
+                return f"Sample rows from '{table_name}':\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error sampling '{table_name}': {e}"
+
+    # ── Tool 4 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_foreign_keys(table_name: str) -> str:
+        """Get foreign key relationships for a table. Use this to understand how to JOIN tables."""
+        try:
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    q = text("""
+                        SELECT kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_col
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+                        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public' AND tc.table_name = :t
+                    """)
+                    rows = conn.execute(q, {"t": table_name}).fetchall()
+                    lines = [f"  {table_name}.{r[0]} -> {r[1]}.{r[2]}" for r in rows]
+                elif db_type == "mysql":
+                    q = text("SELECT column_name, referenced_table_name, referenced_column_name FROM information_schema.key_column_usage WHERE table_schema = :db AND table_name = :t AND referenced_table_name IS NOT NULL")
+                    rows = conn.execute(q, {"db": db_name, "t": table_name}).fetchall()
+                    lines = [f"  {table_name}.{r[0]} -> {r[1]}.{r[2]}" for r in rows]
+                else:
+                    rows = conn.execute(text(f"PRAGMA foreign_key_list({qi(table_name)})")).fetchall()
+                    lines = [f"  {table_name}.{r[3]} -> {r[2]}.{r[4]}" for r in rows]
+                if not lines:
+                    return f"No foreign keys found on '{table_name}'."
+                return f"Foreign keys for '{table_name}':\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error getting foreign keys for '{table_name}': {e}"
+
+    # ── Tool 5 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_table_relationships() -> str:
+        """Get ALL foreign key relationships in the database. Use for multi-table queries."""
+        try:
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    q = text("""
+                        SELECT tc.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_col
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+                        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+                        ORDER BY tc.table_name
+                    """)
+                    rows = conn.execute(q).fetchall()
+                    lines = [f"  {r[0]}.{r[1]} -> {r[2]}.{r[3]}" for r in rows]
+                elif db_type == "mysql":
+                    q = text("SELECT table_name, column_name, referenced_table_name, referenced_column_name FROM information_schema.key_column_usage WHERE table_schema = :db AND referenced_table_name IS NOT NULL ORDER BY table_name")
+                    rows = conn.execute(q, {"db": db_name}).fetchall()
+                    lines = [f"  {r[0]}.{r[1]} -> {r[2]}.{r[3]}" for r in rows]
+                else:
+                    tables_q = "SELECT name FROM sqlite_master WHERE type='table'"
+                    tables = [r[0] for r in conn.execute(text(tables_q)).fetchall()]
+                    lines = []
+                    for t in tables:
+                        try:
+                            fks = conn.execute(text(f"PRAGMA foreign_key_list({qi(t)})")).fetchall()
+                            for fk in fks:
+                                lines.append(f"  {t}.{fk[3]} -> {fk[2]}.{fk[4]}")
+                        except Exception:
+                            pass
+                if not lines:
+                    return "No foreign key relationships found in this database."
+                return f"Database relationships ({len(lines)}):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error getting relationships: {e}"
+
+    # ── Tool 6 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_indexes(table_name: str) -> str:
+        """Get indexes defined on a table. Helps write efficient WHERE and ORDER BY clauses."""
+        try:
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    q = text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = :t AND schemaname = 'public'")
+                    rows = conn.execute(q, {"t": table_name}).fetchall()
+                    lines = [f"  {r[0]}: {r[1]}" for r in rows]
+                elif db_type == "mysql":
+                    rows = conn.execute(text(f"SHOW INDEX FROM {qi(table_name)}")).fetchall()
+                    lines = [f"  {r[2]} on ({r[4]})" for r in rows]
+                else:
+                    idx_rows = conn.execute(text(f"PRAGMA index_list({qi(table_name)})")).fetchall()
+                    lines = []
+                    for idx in idx_rows:
+                        info = conn.execute(text(f"PRAGMA index_info('{idx[1]}')")).fetchall()
+                        cols = ", ".join(i[2] for i in info)
+                        lines.append(f"  {idx[1]} ({cols})")
+                if not lines:
+                    return f"No indexes found on '{table_name}'."
+                return f"Indexes on '{table_name}':\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error getting indexes for '{table_name}': {e}"
+
+    # ── Tool 7 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_column_stats(table_name: str, column_name: str) -> str:
+        """Get statistics for a column: min, max, count, distinct count, null percentage."""
+        try:
+            with engine.connect() as conn:
+                col = qi(column_name)
+                tbl = qi(table_name)
+                q = text(f"SELECT COUNT(*) as total, COUNT(DISTINCT {col}) as distinct_count, COUNT(*) - COUNT({col}) as null_count, MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}")
+                row = conn.execute(q).fetchone()
+                if not row or row[0] == 0:
+                    return f"Table '{table_name}' is empty."
+                null_pct = round((row[2] / row[0]) * 100, 2) if row[0] > 0 else 0
+                return (
+                    f"Stats for {table_name}.{column_name}:\n"
+                    f"  total rows: {row[0]}\n"
+                    f"  distinct values: {row[1]}\n"
+                    f"  null count: {row[2]} ({null_pct}%)\n"
+                    f"  min: {row[3]}\n"
+                    f"  max: {row[4]}"
+                )
+        except Exception as e:
+            return f"Error getting stats for '{table_name}.{column_name}': {e}"
+
+    # ── Tool 8 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_distinct_values(table_name: str, column_name: str) -> str:
+        """Get distinct values with frequency for categorical columns (status, type, category, etc.). Always use before writing categorical WHERE clauses."""
+        try:
+            with engine.connect() as conn:
+                col = qi(column_name)
+                tbl = qi(table_name)
+                q = text(f"SELECT {col}, COUNT(*) as freq FROM {tbl} GROUP BY {col} ORDER BY freq DESC LIMIT 30")
+                rows = conn.execute(q).fetchall()
+                if not rows:
+                    return f"No data found in '{table_name}.{column_name}'."
+                lines = [f"  '{r[0]}' -> {r[1]} rows" for r in rows]
+                return f"Distinct values for {table_name}.{column_name} ({len(rows)} shown):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error getting distinct values for '{table_name}.{column_name}': {e}"
+
+    # ── Tool 9 ────────────────────────────────────────────────────────────────
+    @tool
+    def get_date_range(table_name: str, column_name: str) -> str:
+        """Get the earliest and latest date in a date/datetime column. Always use before writing date filters."""
+        try:
+            with engine.connect() as conn:
+                col = qi(column_name)
+                tbl = qi(table_name)
+                q = text(f"SELECT MIN({col}), MAX({col}) FROM {tbl}")
+                row = conn.execute(q).fetchone()
+                if not row or row[0] is None:
+                    return f"No date data found in '{table_name}.{column_name}'."
+                return (
+                    f"Date range for {table_name}.{column_name}:\n"
+                    f"  earliest: {row[0]}\n"
+                    f"  latest:   {row[1]}"
+                )
+        except Exception as e:
+            return f"Error getting date range for '{table_name}.{column_name}': {e}"
+
+    # ── Tool 10 ───────────────────────────────────────────────────────────────
+    @tool
+    def search_values(table_name: str, column_name: str, keyword: str) -> str:
+        """Search for values matching a keyword in a column. Always use before writing WHERE clauses with partial names or strings."""
+        try:
+            safe_keyword = keyword.replace("%", r"\%").replace("_", r"\_")
+            pattern = f"%{safe_keyword}%"
+            with engine.connect() as conn:
+                col = qi(column_name)
+                tbl = qi(table_name)
+                if db_type == "postgresql":
+                    q = text(f"SELECT DISTINCT {col}::text FROM {tbl} WHERE {col}::text ILIKE :kw LIMIT 10")
+                else:
+                    q = text(f"SELECT DISTINCT {col} FROM {tbl} WHERE {col} LIKE :kw LIMIT 10")
+                rows = conn.execute(q, {"kw": pattern}).fetchall()
+                if not rows:
+                    return f"No values matching '{keyword}' found in {table_name}.{column_name}."
+                lines = [f"  '{r[0]}'" for r in rows]
+                return f"Values matching '{keyword}' in {table_name}.{column_name}:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error searching values in '{table_name}.{column_name}': {e}"
+
+    # ── Tool 11 ───────────────────────────────────────────────────────────────
+    @tool
+    def count_rows(table_name: str, where_clause: str = "") -> str:
+        """Count rows in a table, optionally with a WHERE clause. Use before large fetches."""
+        try:
+            if where_clause and not _is_safe_where(where_clause):
+                return "Error: WHERE clause contains unsafe keywords."
+            with engine.connect() as conn:
+                tbl = qi(table_name)
+                sql = f"SELECT COUNT(*) FROM {tbl}"
+                if where_clause.strip():
+                    sql += f" WHERE {where_clause}"
+                count = conn.execute(text(sql)).scalar()
+                ctx = f" WHERE {where_clause}" if where_clause.strip() else ""
+                return f"Row count for {table_name}{ctx}: {count:,} rows"
+        except Exception as e:
+            return f"Error counting rows in '{table_name}': {e}"
+
+    # ── Tool 12 ───────────────────────────────────────────────────────────────
+    @tool
+    def explain_query(sql: str) -> str:
+        """Get the query execution plan to check if a query will be slow before running it."""
+        try:
+            if not _is_safe_query(sql):
+                return "Error: Only SELECT queries can be explained."
+            with engine.connect() as conn:
+                if db_type == "postgresql":
+                    rows = conn.execute(text(f"EXPLAIN {sql}")).fetchall()
+                elif db_type == "mysql":
+                    rows = conn.execute(text(f"EXPLAIN {sql}")).fetchall()
+                else:
+                    rows = conn.execute(text(f"EXPLAIN QUERY PLAN {sql}")).fetchall()
+                plan_text = "\n".join("  " + " | ".join(str(c) for c in r) for r in rows)
+                warning = ""
+                plan_upper = plan_text.upper()
+                if "SEQ SCAN" in plan_upper or "ALL" in plan_upper or "SCAN TABLE" in plan_upper:
+                    warning = "\n  ⚠️  WARNING: Full table scan detected. Consider adding LIMIT or using an indexed column."
+                return f"Query plan:\n{plan_text}{warning}"
+        except Exception as e:
+            return f"Error explaining query: {e}"
+
+    # ── Tool 13 ───────────────────────────────────────────────────────────────
+    @tool
+    def run_sql(query: str) -> str:
+        """Execute a SELECT SQL query and return results. Only SELECT queries are allowed. Stores results for the caller."""
+        if not _is_safe_query(query):
+            err = "Error: Only SELECT queries are allowed. Destructive operations are blocked."
+            results_store["error"] = err
+            return err
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text(query))
+                columns = list(result.keys())
+                rows = result.fetchmany(1000)
+                data = []
+                for row in rows:
+                    data.append({col: _convert_value(val) for col, val in zip(columns, row)})
+
+                results_store["sql"] = query
+                results_store["results"] = {"columns": columns, "data": data, "row_count": len(data)}
+                results_store["error"] = ""
+
+                if not data:
+                    return "Query executed successfully. No rows returned."
+                preview = data[:3]
+                lines = [f"  Row {i+1}: {row}" for i, row in enumerate(preview)]
+                suffix = f"\n  ... and {len(data) - 3} more rows" if len(data) > 3 else ""
+                return f"Query returned {len(data)} rows.\nColumns: {', '.join(columns)}\n" + "\n".join(lines) + suffix
+        except Exception as e:
+            err = f"SQL Error: {str(e)}"
+            results_store["error"] = err
+            return err
+
+    all_tools = [
+        list_tables, describe_table, sample_rows,
+        get_foreign_keys, get_table_relationships, get_indexes,
+        get_column_stats, get_distinct_values, get_date_range,
+        search_values, count_rows, explain_query, run_sql,
+    ]
+    return all_tools, results_store
+
 
 class LangGraphService:
-    """Service for LangGraph AI operations"""
-    
-    _llm = None
-    _deep_think_llm = None
-    _graph = None
-    
-    @staticmethod
-    def _parse_json_response(response_text: str) -> dict:
-        """Safely parse JSON response from LLM"""
+    """Agentic database assistant using a ReAct loop with 13 DB exploration tools."""
+
+    @classmethod
+    async def run_agent(
+        cls,
+        question: str,
+        engine,
+        db_type: str,
+        db_name: str,
+        conversation_history: list,
+        step_queue: Optional[asyncio.Queue] = None,
+    ) -> dict:
+        """Run the ReAct agent. Streams agent steps to step_queue if provided."""
+        llm = get_llm()
+        tools, results_store = build_tools(engine, db_type, db_name)
+        system_prompt = _build_agent_system_prompt()
+
+        agent = create_react_agent(model=llm, tools=tools, state_modifier=system_prompt)
+
+        messages = []
+        for msg in (conversation_history or [])[-10:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        messages.append(HumanMessage(content=question))
+
+        final_ai_message = ""
         try:
-            # Try to parse as JSON
-            import json
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON from markdown code blocks
-            import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-            if json_match:
-                try:
-                    return json.loads(json_match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            
-            # If still fails, try to find any JSON object in the text
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-            if json_match:
-                try:
-                    return json.loads(json_match.group(0))
-                except json.JSONDecodeError:
-                    pass
-            
-            # Return error structure
-            return {
-                "action": "SQL",
-                "sql": "",
-                "explain": f"Failed to parse JSON response: {response_text[:100]}...",
-                "error": "JSON parsing failed"
-            }
-    
-    @classmethod
-    def _initialize(cls):
-        """Initialize LangGraph components"""
-        if cls._llm is None:
-            cls._llm = ChatOpenAI(
-                model=settings.OPENAI_MODEL,
-                temperature=0,
-                api_key=settings.OPENAI_API_KEY
-            )
-            cls._deep_think_llm = ChatOpenAI(
-                model=settings.OPENAI_REASONING_MODEL,
-                temperature=1,
-                api_key=settings.OPENAI_API_KEY
-            )
-            cls._graph = cls._build_graph()
-    
-    @classmethod
-    def _build_graph(cls) -> StateGraph:
-        """Build LangGraph workflow"""
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("deep_think", cls._deep_think_node)
-        workflow.add_node("generate_sql", cls._generate_sql_node)
-        workflow.add_node("generate_answer", cls._generate_answer_node)
-        workflow.add_node("generate_summary", cls._generate_summary_node)
-        
-        # Add conditional edges
-        workflow.set_entry_point("deep_think")
-        workflow.add_edge("deep_think", "generate_sql")
-        workflow.add_edge("generate_sql", "generate_answer")
-        workflow.add_edge("generate_answer", "generate_summary")
-        workflow.add_edge("generate_summary", END)
-        
-        return workflow.compile()
-    
-    @classmethod
-    def _deep_think_node(cls, state: AgentState) -> AgentState:
-        """Deep thinking preprocessing to understand user intent and database structure"""
-        if not state.get("use_deep_think", False):
-            # Skip deep thinking if not enabled
-            state["refined_question"] = state["question"]
-            return state
-        
-        # Format conversation history
-        history_text = ""
-        if state.get("conversation_history"):
-            history_text = "\n\nConversation History:\n"
-            for msg in state["conversation_history"][-6:]:  # Last 3 exchanges (6 messages)
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                history_text += f"{role.upper()}: {content}\n"
-        
-        # Note: o1 models don't support system messages, only user messages
-        prompt = ChatPromptTemplate.from_messages([
-            ("user", """You are an expert database analyst with deep understanding of business terminology and database structures.
-
-Your task is to analyze the user's natural language question and the database schema to:
-1. Review the conversation history to understand the context of follow-up questions
-2. Understand what the user REALLY wants (they may not know exact column names or technical terms)
-3. **CRITICAL - Understand Business Roles and Context**:
-   - When someone "sells" or "sold" something → they are the SALESPERSON/SELLER/EMPLOYEE (NOT the customer)
-   - When someone "buys" or "bought" something → they are the CUSTOMER/BUYER (NOT the salesperson)
-   - "how much did X sell?" → X is likely a salesperson, look for employee/salesperson/user columns
-   - "what did X buy?" → X is likely a customer, look for customer columns
-   - "top sellers" → sales staff who made sales
-   - "top customers" → buyers who purchased
-   
-   **CRITICAL - Revenue vs Expenses:**
-   - "how much X makes/made/earned" → REVENUE/SALES → Use Invoices, Sales, Orders tables (money IN)
-   - "how much X spent/spend" → EXPENSES/COSTS → Use Expenses, Costs tables (money OUT)
-   - "earnings", "revenue", "sales" = Invoices/Sales tables
-   - "expenses", "costs", "spending" = Expenses tables
-   - Example: "how much azka makes in october?" → Use Invoices/Sales table to find azka's sales revenue
-4. Map business/casual terms to actual database columns and tables
-5. Identify relationships between tables that might be needed
-6. **Handle partial/fuzzy name searches**: When user mentions a partial name (e.g., "azka", "john"), identify that this likely needs fuzzy matching in the query, not exact matching
-7. Clarify any ambiguities in the question
-8. Reformulate the question with precise technical terms that match the schema
-
-For example:
-- "how much did azka sell?" → Find SALESPERSON/USER named 'azka' (NOT customer), calculate their sales
-- "sales person" might map to "salesperson_name" or "employee" table  
-- "profit" might need calculation from "revenue - cost" columns
-- "this month" needs to be translated to date filters
-- "product ABC" might be in "product_name" or "product_code" column
-- "who is the second?" in context of previous "top salesperson" question means "second highest salesperson"
-- **"john's sales"** should match any SALESPERSON name containing "john" (fuzzy match needed)
-
-Database Schema:
-{schema}
-{history}
-Original Question: {question}
-
-**IMPORTANT - Ambiguity Detection:**
-If the question is ambiguous or could be interpreted multiple ways, respond ONLY with:
-"CLARIFICATION_NEEDED: [option1] | [option2] | [option3]"
-
-Ambiguous scenarios include:
-- Multiple tables could match (e.g., "sales" could be sales_2023, sales_archive, sales_summary)
-- Time period unclear ("recent", "this period", "lately" without context)
-- Aggregation method ambiguous (should we SUM, AVG, COUNT, MAX?)
-- Multiple similar column names exist
-
-Otherwise, provide a refined, technically precise question that uses exact column and table names from the schema.
-When partial names are mentioned, explicitly note that fuzzy matching is needed.
-Only output the refined question or clarification request, nothing else.""")
-        ])
-        
-        try:
-            print(f"🧠 Deep thinking about: {state['question']}")
-            
-            response = cls._deep_think_llm.invoke(
-                prompt.format_messages(
-                    schema=state["schema"],
-                    question=state["question"],
-                    history=history_text
-                )
-            )
-            
-            refined_question = response.content.strip()
-            print(f"💡 Refined question:  {refined_question}")
-            
-            # Check if clarification is needed
-            if refined_question.startswith("CLARIFICATION_NEEDED:"):
-                # Parse clarification options
-                options_text = refined_question.replace("CLARIFICATION_NEEDED:", "").strip()
-                options = [opt.strip() for opt in options_text.split("|") if opt.strip()]
-                
-                print(f"❓ Clarification needed - {len(options)} options provided")
-                state["needs_clarification"] = True
-                state["clarification_options"] = options
-                state["refined_question"] = state["question"]  # Keep original
-                return state
-            
-            # Extract reasoning/thinking process from response metadata if available
-            reasoning = ""
-            if hasattr(response, 'response_metadata'):
-                # o1 models may include reasoning in response metadata or usage stats
-                metadata = response.response_metadata
-                if 'reasoning' in metadata:
-                    reasoning = metadata['reasoning']
-                elif 'usage' in metadata and 'completion_tokens_details' in metadata['usage']:
-                    # o1 models show reasoning tokens
-                    details = metadata['usage']['completion_tokens_details']
-                    if 'reasoning_tokens' in details and details['reasoning_tokens'] > 0:
-                        reasoning = f"🧠 Reasoning tokens used: {details['reasoning_tokens']}\n\nThe AI performed deep chain-of-thought reasoning to understand your question and map it to the database schema."
-            
-            state["refined_question"] = refined_question
-            state["reasoning"] = reasoning
-            state["error"] = ""
-            
+            async for chunk in agent.astream(
+                {"messages": messages},
+                stream_mode="updates",
+                config={"recursion_limit": 25},
+            ):
+                if step_queue and "tools" in chunk:
+                    for msg in chunk["tools"].get("messages", []):
+                        tool_name = getattr(msg, "name", "") or ""
+                        if tool_name:
+                            icon = TOOL_ICONS.get(tool_name, "🔧")
+                            label = tool_name.replace("_", " ").title()
+                            await step_queue.put({"type": "agent_step", "content": f"{icon} {label}..."})
+                if "agent" in chunk:
+                    for msg in chunk["agent"].get("messages", []):
+                        content = getattr(msg, "content", "") or ""
+                        if content and isinstance(content, str):
+                            final_ai_message = content
         except Exception as e:
-            print(f"⚠️  Deep thinking failed, using original question: {str(e)}")
-            state["refined_question"] = state["question"]
-            state["reasoning"] = f"⚠️ Reasoning model unavailable: {str(e)}\n\nUsing standard model instead."
-            state["error"] = ""
-        
-        return state
-    
+            if step_queue:
+                await step_queue.put({"type": "agent_step", "content": f"⚠️ Agent error: {str(e)[:120]}"})
+            results_store["error"] = str(e)
+
+        return {
+            "sql": results_store["sql"],
+            "results": results_store["results"],
+            "error": results_store["error"],
+            "final_message": final_ai_message,
+        }
+
     @classmethod
-    def _generate_sql_node(cls, state: AgentState) -> AgentState:
-        """Generate SQL query from natural language question"""
-        # Format conversation history for context
-        history_text = ""
-        if state.get("conversation_history"):
-            history_text = "\n\nConversation History (for context):\n"
-            for msg in state["conversation_history"][-6:]:  # Last 3 exchanges
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                history_text += f"{role.upper()}: {content}\n"
-            history_text += "\n"
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SQL_SYSTEM_PROMPT),
-            ("human", "{history}Question: {question}\n\nProvide your response as valid JSON:")
-        ])
-        
-        try:
-            # Use refined question if available (from deep thinking), otherwise use original
-            question_to_use = state.get("refined_question", state["question"])
-            print(f"🤖 Generating SQL for: {question_to_use}")
-            print(f"📋 Schema length: {len(state['schema'])} chars")
-            
-            # Get database type for formatting
-            db_type = state.get("db_type", "mysql").upper()
-            
-            # Get current date context
-            from datetime import datetime
-            now = datetime.now()
-            current_date = now.strftime("%Y-%m-%d")
-            current_year = now.year
-            current_month = now.strftime("%B")  # Full month name
-            
-            print(f"📅 Current context: {current_date} ({current_month} {current_year})")
-            
-            response = cls._llm.invoke(
-                prompt.format_messages(
-                    schema=state["schema"],
-                    question=question_to_use,
-                    history=history_text,
-                    db_type=db_type,
-                    current_date=current_date,
-                    current_year=current_year,
-                    current_month=current_month
-                )
-            )
-            
-            # Parse JSON response
-            response_text = response.content.strip()
-            print(f"📄 Raw response: {response_text[:200]}...")
-            
-            json_response = cls._parse_json_response(response_text)
-            
-            action = json_response.get("action", "SQL")
-            explain = json_response.get("explain", "")
-            
-            print(f"✅ Action: {action}")
-            if explain:
-                print(f"💡 Explanation: {explain}")
-                # Append explanation to existing reasoning if present
-                current_reasoning = state.get("reasoning", "")
-                if current_reasoning:
-                    state["reasoning"] = f"{current_reasoning}\n\n**SQL Generation Reasoning:**\n{explain}"
-                else:
-                    state["reasoning"] = explain
-            
-            # Handle different action types
-            if action == "SQL":
-                sql_query = json_response.get("sql", "")
-                if sql_query:
-                    print(f"✅ Generated SQL: {sql_query}")
-                    state["sql_query"] = sql_query
-                    state["error"] = ""
-                else:
-                    state["error"] = "No SQL query returned in response"
-                    state["sql_query"] = ""
-                    
-            elif action == "CLARIFY":
-                clarify_text = json_response.get("clarify", "")
-                print(f"❓ Clarification needed: {clarify_text}")
-                state["needs_clarification"] = True
-                state["clarification_options"] = [clarify_text]
-                state["sql_query"] = ""
-                state["error"] = ""
-                
-            elif action == "ANSWER":
-                answer_text = json_response.get("answer", "")
-                print(f"💬 Direct answer: {answer_text}")
-                # Set answer directly and skip SQL execution
-                state["answer"] = answer_text
-                state["sql_query"] = ""
-                state["error"] = ""
-                
-            else:
-                state["error"] = f"Unknown action type: {action}"
-                state["sql_query"] = ""
-            
-        except Exception as e:
-            state["error"] = f"SQL generation error: {str(e)}"
-            state["sql_query"] = ""
-        
-        return state
-    
-    @classmethod
-    def _generate_answer_node(cls, state: AgentState) -> AgentState:
-        """Generate natural language answer from query results"""
-        if state.get("error"):
-            state["answer"] = f"Error: {state['error']}"
-            return state
-        
-        results = state.get("results", {})
-        data = results.get("data", [])
-        
+    async def generate_answer(cls, question: str, results: dict, sql_query: str = "") -> str:
+        """Generate a natural language answer from query results."""
+        data = results.get("data", []) if results else []
+        columns = results.get("columns", []) if results else []
+        row_count = results.get("row_count", 0) if results else 0
+
         if not data:
-            state["answer"] = "No results found for your query."
-            return state
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful data analyst assistant.
-Given a question, the SQL query used, and query results, provide a clear, concise natural language answer.
+            return "No results were found for your query."
 
-Rules:
-1. Be direct and specific
-2. Include relevant numbers and data points
-3. Keep it conversational
-4. If multiple rows, summarize appropriately
-5. Use Malaysian Ringgit (RM) for currency values, not $ or USD
-6. IMPORTANT: Look at the SQL query to understand what filters were applied (e.g., specific user, date range) and mention them in your answer
-7. If the SQL filters by a user (e.g., WHERE name LIKE '%azka%'), mention that user by name in your answer"""),
-            ("human", """Question: {question}
+        llm = get_llm()
+        preview = data[:20]
+        results_text = f"Columns: {', '.join(columns)}\nRows ({row_count} total):\n"
+        results_text += "\n".join(str(row) for row in preview)
+        if row_count > 20:
+            results_text += f"\n... ({row_count - 20} more rows)"
+
+        prompt = f"""Based on the following database query results, provide a clear and concise answer to the user's question.
+
+Question: {question}
 
 SQL Query: {sql_query}
 
-Results: {results}
+Results:
+{results_text}
 
-Provide a natural language answer:""")
-        ])
-        
+Provide a direct, helpful answer. Use numbers and specifics from the data. Format nicely with markdown if helpful."""
+
         try:
-            # Format results for LLM
-            results_text = "\n".join([str(row) for row in data[:5]])  # First 5 rows
-            
-            response = cls._llm.invoke(
-                prompt.format_messages(
-                    question=state["question"],
-                    sql_query=state.get("sql_query", ""),
-                    results=results_text
-                )
-            )
-            
-            state["answer"] = response.content.strip()
-            
+            from langchain_core.messages import HumanMessage as HM
+            response = await llm.ainvoke([HM(content=prompt)])
+            return response.content
         except Exception as e:
-            state["answer"] = f"Answer generation error: {str(e)}"
-        
-        return state
-    
+            return f"Results retrieved successfully. {row_count} rows returned. (Answer generation failed: {e})"
+
     @classmethod
-    def _generate_summary_node(cls, state: AgentState) -> AgentState:
-        """Generate data summarization and insights"""
-        if state.get("error"):
-            state["summary"] = ""
-            return state
-        
-        results = state.get("results", {})
-        data = results.get("data", [])
-        
+    async def generate_summary(cls, question: str, results: dict) -> str:
+        """Generate a brief one-line summary of the results."""
+        data = results.get("data", []) if results else []
+        row_count = results.get("row_count", 0) if results else 0
+
         if not data:
-            state["summary"] = "No data to summarize."
-            return state
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a data analyst providing insights and summarization.
-Given a question and query results, provide:
-1. Key insights and patterns
-2. Statistical summary (totals, averages, trends)
-3. Notable observations
-4. Actionable takeaways
+            return "No results found."
 
-Be concise but informative. Use bullet points for clarity.
-Use Malaysian Ringgit (RM) for all currency values, not $ or USD."""),
-            ("human", """Question: {question}
+        llm = get_llm()
+        prompt = f"""Summarize in one sentence (max 20 words): 
+Question: {question}
+Results: {row_count} rows returned. First row: {data[0] if data else 'none'}"""
 
-Results: {results}
-Row Count: {row_count}
-
-Provide a comprehensive summary with insights:""")
-        ])
-        
         try:
-            # Format results for LLM (include more rows for better analysis)
-            results_text = "\n".join([str(row) for row in data[:20]])  # First 20 rows
-            
-            response = cls._llm.invoke(
-                prompt.format_messages(
-                    question=state["question"],
-                    results=results_text,
-                    row_count=len(data)
-                )
-            )
-            
-            state["summary"] = response.content.strip()
-            
-        except Exception as e:
-            state["summary"] = f"Summary generation error: {str(e)}"
-        
-        return state
-    
-    @classmethod
-    async def generate_sql(cls, question: str, schema: str, use_deep_think: bool = False, conversation_history: list = None, db_type: str = "mysql") -> dict:
-        """Generate SQL query from natural language"""
-        cls._initialize()
-        
-        initial_state = {
-            "question": question,
-            "schema": schema,
-            "sql_query": "",
-            "results": {},
-            "answer": "",
-            "summary": "",
-            "error": "",
-            "use_deep_think": use_deep_think,
-            "refined_question": "",
-            "reasoning": "",
-            "conversation_history": conversation_history or [],
-            "db_type": db_type,
-            "needs_clarification": False,
-            "clarification_options": []
-        }
-        
-        # Run deep thinking if enabled, then SQL generation
-        state = cls._deep_think_node(initial_state)
-        
-        # If clarification is needed, return early with clarification info
-        if state.get("needs_clarification"):
-            return {
-                "sql_query": "",
-                "error": "",
-                "reasoning": "",
-                "needs_clarification": True,
-                "clarification_options": state.get("clarification_options", []),
-                "direct_answer": None
-            }
-        
-        state = cls._generate_sql_node(state)
-        
-        # Check if we got a direct answer (ANSWER action type)
-        direct_answer = state.get("answer", "")
-        
-        return {
-            "sql_query": state["sql_query"],
-            "error": state.get("error", ""),
-            "reasoning": state.get("reasoning", ""),
-            "needs_clarification": False,
-            "clarification_options": [],
-            "direct_answer": direct_answer if direct_answer else None
-        }
-    
-    @classmethod
-    async def generate_answer(cls, question: str, results: dict, sql_query: str = "") -> dict:
-        """Generate natural language answer and summary from results"""
-        cls._initialize()
-        
-        state = {
-            "question": question,
-            "schema": "",
-            "sql_query": sql_query,
-            "results": results,
-            "answer": "",
-            "summary": "",
-            "error": ""
-        }
-        
-        # Run answer generation
-        state = cls._generate_answer_node(state)
-        
-        # Run summary generation
-        state = cls._generate_summary_node(state)
-        
-        return {
-            "answer": state["answer"],
-            "summary": state["summary"],
-            "error": state.get("error", "")
-        }
+            from langchain_core.messages import HumanMessage as HM
+            response = await llm.ainvoke([HM(content=prompt)])
+            return response.content.strip()
+        except Exception:
+            return f"Found {row_count} result(s) for your query."

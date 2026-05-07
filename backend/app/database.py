@@ -6,8 +6,15 @@ import os
 # Get database URL from environment variable
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://dbassistant:dbassistant_password@localhost:5432/dbassistant")
 
-# Create SQLAlchemy engine
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# Create SQLAlchemy engine with connection pooling limits for low memory
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=False,
+    pool_size=3,           # Keep 3 connections ready
+    max_overflow=0,        # No extra connections beyond pool_size
+    pool_recycle=3600,     # Recycle connections after 1 hour
+    pool_timeout=30        # Wait up to 30s for available connection
+)
 
 # Create SessionLocal class
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

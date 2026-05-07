@@ -6,16 +6,19 @@ from ..models.database import DatabaseConnection as PydanticDatabaseConnection, 
 from ..models.db_models import DatabaseConnection as DBDatabaseConnection
 from ..config.settings import settings
 from decimal import Decimal
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
+import time
 
 
 class DatabaseService:
     """Service for database connection management and operations (PostgreSQL-backed)"""
     
-    _engines = {}  # Cache for SQLAlchemy engines
+    _engines: dict = {}           # {connection_id: (engine, last_used_timestamp)}
     _fernet = Fernet(settings.DATABASE_ENCRYPTION_KEY.encode())
+    _schema_cache: dict = {}        # {cache_key: (schema_text, expires_at)}
+    _engine_ttl = 7200              # Dispose idle engines after 2 hours
     
     @classmethod
     def _encrypt(cls, value: str) -> str:
@@ -119,7 +122,7 @@ class DatabaseService:
         
         # Close old engine if exists
         if connection_id in cls._engines:
-            cls._engines[connection_id].dispose()
+            cls._engines[connection_id][0].dispose()
             del cls._engines[connection_id]
         
         return cls._db_to_pydantic(db_connection)
@@ -140,31 +143,51 @@ class DatabaseService:
         
         # Close engine if exists
         if connection_id in cls._engines:
-            cls._engines[connection_id].dispose()
+            cls._engines[connection_id][0].dispose()
             del cls._engines[connection_id]
         
         return True
     
     @classmethod
+    def _evict_idle_engines(cls):
+        """Dispose engines that haven't been used in _engine_ttl seconds."""
+        now = time.time()
+        idle = [cid for cid, (eng, ts) in cls._engines.items() if now - ts > cls._engine_ttl]
+        for cid in idle:
+            try:
+                cls._engines[cid][0].dispose()
+            except Exception:
+                pass
+            del cls._engines[cid]
+
+    @classmethod
     def _get_engine(cls, db: Session, user_id: int, connection_id: int) -> Optional[Engine]:
-        """Get or create SQLAlchemy engine for a connection"""
+        """Get or create SQLAlchemy engine for a connection (with LRU eviction)."""
+        cls._evict_idle_engines()
+
         if connection_id in cls._engines:
-            return cls._engines[connection_id]
-        
-        # Fetch connection from database
+            engine, _ = cls._engines[connection_id]
+            cls._engines[connection_id] = (engine, time.time())
+            return engine
+
         db_connection = db.query(DBDatabaseConnection).filter(
             DBDatabaseConnection.id == connection_id,
-            DBDatabaseConnection.user_id == user_id
+            DBDatabaseConnection.user_id == user_id,
         ).first()
-        
+
         if not db_connection:
             return None
-        
+
         try:
             connection = cls._db_to_pydantic(db_connection, include_password=True)
             connection_string = cls._build_connection_string(connection)
-            engine = create_engine(connection_string)
-            cls._engines[connection_id] = engine
+            engine = create_engine(
+                connection_string,
+                pool_size=2,
+                max_overflow=1,
+                pool_recycle=1800,
+            )
+            cls._engines[connection_id] = (engine, time.time())
             return engine
         except Exception as e:
             print(f"Error creating engine: {e}")
@@ -248,7 +271,16 @@ class DatabaseService:
     
     @classmethod
     async def get_schema_info(cls, db: Session, user_id: int, connection_id: int) -> str:
-        """Get database schema information for LangGraph with sample data"""
+        """Get database schema information for LangGraph with sample data (cached)"""
+        cache_key = f"{user_id}_{connection_id}"
+        
+        # Check cache first
+        if cache_key in cls._schema_cache:
+            cached_data, expires_at = cls._schema_cache[cache_key]
+            if time.time() < expires_at:
+                print(f"📊 Schema cache hit for connection {connection_id}")
+                return cached_data
+        
         engine = cls._get_engine(db, user_id, connection_id)
         if not engine:
             return ""
@@ -334,6 +366,9 @@ class DatabaseService:
                         schema_info += f"  (Sample data unavailable: {str(e)[:50]})\n"
                 
                 print(f"📊 Schema retrieved with sample data ({len(rows)} columns)")
+                
+                # Cache the result
+                cls._schema_cache[cache_key] = (schema_info, time.time() + settings.SCHEMA_CACHE_TTL)
                 return schema_info
         except Exception as e:
             print(f"Error getting schema: {e}")

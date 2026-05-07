@@ -54,7 +54,7 @@ docker-compose up -d --build
 - **API Docs**: http://localhost:8000/docs
 
 **Default Login:**
-- Username: `admin`
+- Email: `admin@example.com`
 - Password: `admin123`
 
 ### Step 4: Stop Services

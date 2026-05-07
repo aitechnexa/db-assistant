@@ -33,9 +33,16 @@ function ChatMessage({ message, darkMode, onClarificationSelect }) {
         {message.role === 'assistant' ? (
           <div className="space-y-2">
             {message.thinking && (
-              <div className={`flex items-center gap-2 text-sm ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                {message.thinking}
+              <div className={`flex flex-col gap-1 text-sm ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                <div className="flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />
+                  <span>{message.thinking}</span>
+                  {message.agentSteps && message.agentSteps.length > 1 && (
+                    <span className={`text-xs px-1.5 py-0.5 rounded-full ${darkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+                      {message.agentSteps.length} steps
+                    </span>
+                  )}
+                </div>
               </div>
             )}
             {message.content && (
@@ -280,16 +287,22 @@ export default function AgenticChatbot({ connectionId, darkMode, databases, onSe
                 setMessages(prev => {
                   const newMessages = [...prev]
                   const lastMsg = newMessages[newMessages.length - 1]
-                  // Only update if last message is from assistant and has thinking or no content yet
                   if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content) {
                     lastMsg.thinking = data.content
                     return newMessages
                   }
-                  // Otherwise create new thinking message
-                  return [...prev, {
-                    role: 'assistant',
-                    thinking: data.content
-                  }]
+                  return [...prev, { role: 'assistant', thinking: data.content, agentSteps: [] }]
+                })
+              } else if (data.type === 'agent_step') {
+                setMessages(prev => {
+                  const newMessages = [...prev]
+                  const lastMsg = newMessages[newMessages.length - 1]
+                  if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content) {
+                    lastMsg.agentSteps = [...(lastMsg.agentSteps || []), data.content]
+                    lastMsg.thinking = data.content
+                    return [...newMessages.slice(0, -1), { ...lastMsg }]
+                  }
+                  return [...prev, { role: 'assistant', thinking: data.content, agentSteps: [data.content] }]
                 })
               } else if (data.type === 'tool_call') {
                 // Don't show tool calls in chat

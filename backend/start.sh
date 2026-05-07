@@ -13,6 +13,12 @@ echo "Running database migrations..."
 cd /app
 alembic upgrade head
 
-# Start the application  
-echo "Starting application..."
-exec uvicorn app.main:app --host 0.0.0.0 --port 5010 --reload
+# Start the application with Uvicorn for production
+echo "Starting application with Uvicorn..."
+# 1 worker for 1CPU, 2 threads, 120s timeout for AI operations
+exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 5010 \
+    --workers 1 \
+    --timeout-keep-alive 5 \
+    --log-level info

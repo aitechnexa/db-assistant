@@ -26,14 +26,20 @@ class AuthService:
         return pwd_context.verify(plain_password, hashed_password)
     
     @staticmethod
-    def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-        """Create JWT access token"""
-        to_encode = data.copy()
+    def create_access_token(user, expires_delta: Optional[timedelta] = None) -> str:
+        """Create JWT access token with user claims embedded to avoid DB lookups."""
         if expires_delta:
             expire = datetime.utcnow() + expires_delta
         else:
             expire = datetime.utcnow() + timedelta(hours=settings.ACCESS_TOKEN_EXPIRE_HOURS)
-        to_encode.update({"exp": expire})
+        to_encode = {
+            "sub": user.id,
+            "email": user.email,
+            "tier": user.subscription_tier.value if hasattr(user.subscription_tier, 'value') else str(user.subscription_tier),
+            "is_active": user.is_active,
+            "is_admin": getattr(user, 'is_admin', False),
+            "exp": expire,
+        }
         encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
         return encoded_jwt
     
