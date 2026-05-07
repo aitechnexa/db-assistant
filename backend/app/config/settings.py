@@ -45,7 +45,8 @@ class Settings:
         "http://127.0.0.1:5020",
         # Production
         "https://db-assistant.aitechnexa.com",
-        "http://db-assistant.aitechnexa.com"
+        "http://db-assistant.aitechnexa.com",
+        "http://152.42.248.82",
     ]
     
     # Query Settings
